@@ -1,0 +1,94 @@
+name: Build and Sign Android APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.x'
+          channel: 'stable'
+
+      - name: Ensure Android Project Files
+        run: flutter create . --platforms=android --project-name fish_audio_reader
+
+      # 1. 注入真实路径最高权限 (MANAGE_EXTERNAL_STORAGE)
+      - name: Inject Android Permissions
+        run: |
+          sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />' android/app/src/main/AndroidManifest.xml
+          sed -i 's/<application/<application android:requestLegacyExternalStorage="true"/' android/app/src/main/AndroidManifest.xml
+
+      # 2. 严谨整行替换 compileSdk 与 targetSdk 为 35（杜绝破坏 flutter 变量名）
+      - name: Fix Android SDK Versions
+        run: |
+          python3 -c '
+          path = "android/app/build.gradle"
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          import re
+          # 安全替换 compileSdk / compileSdkVersion 为 35
+          content = re.sub(r"compileSdk\s*=.*", "compileSdk = 35", content)
+          content = re.sub(r"compileSdkVersion\s+.*", "compileSdkVersion 35", content)
+          # 安全替换 targetSdk / targetSdkVersion 为 35
+          content = re.sub(r"targetSdk\s*=.*", "targetSdk = 35", content)
+          content = re.sub(r"targetSdkVersion\s+.*", "targetSdkVersion 35", content)
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(content)
+          '
+
+      # 3. 升级 Kotlin 至 2.1.0 消除 metadata 兼容警告
+      - name: Set Kotlin Version
+        run: |
+          if [ -f "android/settings.gradle" ]; then
+            sed -i 's/id "org.jetbrains.kotlin.android" version "[^"]*"/id "org.jetbrains.kotlin.android" version "2.1.0"/' android/settings.gradle
+          fi
+          if [ -f "android/build.gradle" ]; then
+            sed -i 's/ext.kotlin_version = .*/ext.kotlin_version = "2.1.0"/' android/build.gradle
+          fi
+
+      - name: Install Dependencies
+        run: flutter pub get
+
+      - name: Build Release APK
+        run: flutter build apk --release --no-tree-shake-icons
+
+      # 签名配置
+      - name: Sign APK (If Secret Provided)
+        if: env.HAS_SECRET == 'true'
+        uses: r0adkll/sign-android-release@v1
+        id: sign_app
+        env:
+          HAS_SECRET: ${{ secrets.ANDROID_SIGNING_KEY != '' }}
+        with:
+          releaseDirectory: build/app/outputs/flutter-apk
+          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          alias: ${{ secrets.ANDROID_KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: fish-audio-reader-apk
+          path: |
+            build/app/outputs/flutter-apk/*-signed.apk
+            build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
